@@ -12,6 +12,13 @@ struct Document {
 pub struct Documents(HashMap<Url, Document>);
 
 impl Documents {
+    pub fn texts(&self) -> HashMap<Url, String> {
+        self.0
+            .iter()
+            .map(|(uri, doc)| (uri.clone(), doc.text.clone()))
+            .collect()
+    }
+
     pub fn open(&mut self, uri: Url, text: String, version: i32) -> bool {
         use std::collections::hash_map::Entry;
         if let Entry::Vacant(entry) = self.0.entry(uri) {
@@ -54,7 +61,6 @@ impl Documents {
 
 /// Convert a UTF-8 byte boundary to a UTF-16 LSP position. An offset within a
 /// CRLF pair, a multibyte character, or beyond the text is invalid.
-#[allow(dead_code)] // Used by diagnostics in the next implementation step.
 pub fn byte_to_position(text: &str, offset: usize) -> Option<Position> {
     if offset > text.len() || !text.is_char_boundary(offset) {
         return None;

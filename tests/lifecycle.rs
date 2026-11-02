@@ -84,3 +84,77 @@ fn stdio_lifecycle() {
     assert!(remaining.is_empty(), "unexpected stdout: {remaining:?}");
     assert!(child.wait().unwrap().success());
 }
+
+#[cfg(unix)]
+#[test]
+fn publishes_compiler_location_and_clears_on_change() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let dir = std::env::temp_dir().join(format!("jik-lsp-lifecycle-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("source with space.jik");
+    let compiler = dir.join("fake jik");
+    fs::write(&source, "a😀z\n").unwrap();
+    fs::write(
+        &compiler,
+        "#!/bin/sh\nprintf 'jik error: bad\\n --> %s:1:6\\n' \"$2\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+    let uri = tower_lsp::lsp_types::Url::from_file_path(&source)
+        .unwrap()
+        .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jik-lsp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{},"initializationOptions":{"jikPath":compiler}}}),
+    );
+    assert_eq!(receive(&mut output)["id"], 1);
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"a😀z\n"}}}),
+    );
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":uri}}}),
+    );
+    loop {
+        let message = receive(&mut output);
+        if message["method"] == "textDocument/publishDiagnostics" {
+            assert_eq!(message["params"]["uri"], uri);
+            assert_eq!(
+                message["params"]["diagnostics"][0]["range"],
+                json!({"start":{"line":0,"character":3},"end":{"line":0,"character":3}})
+            );
+            break;
+        }
+    }
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"changed"}]}}),
+    );
+    let clear = receive(&mut output);
+    assert_eq!(clear["method"], "textDocument/publishDiagnostics");
+    assert_eq!(clear["params"]["diagnostics"], json!([]));
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}),
+    );
+    assert_eq!(receive(&mut output)["id"], 2);
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"exit","params":null}),
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    fs::remove_dir_all(dir).unwrap();
+}
