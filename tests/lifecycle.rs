@@ -42,10 +42,30 @@ fn stdio_lifecycle() {
     let initialized = receive(&mut output);
     assert_eq!(initialized["id"], 1);
     assert_eq!(initialized["result"]["serverInfo"]["name"], "jik-lsp");
-    assert_eq!(initialized["result"]["capabilities"], json!({}));
+    assert_eq!(
+        initialized["result"]["capabilities"]["textDocumentSync"],
+        json!({"openClose": true, "change": 1, "save": true})
+    );
     send(
         &mut input,
         json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+    let uri = "file:///test.jik";
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"hello"}}}),
+    );
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"changed 😀"}]}}),
+    );
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":uri}}}),
+    );
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),
     );
     send(
         &mut input,

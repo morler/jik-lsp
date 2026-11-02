@@ -1,3 +1,4 @@
+mod document;
 mod server;
 
 use server::Backend;
@@ -7,6 +8,7 @@ use tower_lsp::{LspService, Server};
 async fn main() {
     let (service, socket) = LspService::new(Backend::new);
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
+        .concurrency_level(1)
         .serve(service)
         .await;
 }
