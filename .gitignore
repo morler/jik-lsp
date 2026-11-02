@@ -1,1 +1,3 @@
 /target/
+/.rpi/sessions/
+/.supercov/
