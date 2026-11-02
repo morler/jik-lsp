@@ -126,6 +126,9 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // Concurrent fork/exec can transiently inherit another test's writable script
+    // descriptor and cause ETXTBSY when that script is executed.
+    static PROCESS_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct Fake(PathBuf);
     impl Fake {
@@ -153,6 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn arguments_and_nonzero_status() {
+        let _guard = PROCESS_TEST.lock().await;
         let fake = Fake::new("printf '%s\\n%s' \"$1\" \"$2\"; printf problem >&2; exit 7");
         let result = run_check(
             fake.executable(),
@@ -169,10 +173,10 @@ mod tests {
 
     #[tokio::test]
     async fn combined_limit_and_exact_boundary() {
+        let _guard = PROCESS_TEST.lock().await;
         let fake = Fake::new("printf 1234; printf 5678 >&2");
-        assert!(run_check(fake.executable(), "x", Duration::from_secs(2), 8)
-            .await
-            .is_ok());
+        let exact = run_check(fake.executable(), "x", Duration::from_secs(2), 8).await;
+        assert!(exact.is_ok(), "exact boundary failed: {exact:?}");
         assert!(matches!(
             run_check(fake.executable(), "x", Duration::from_secs(2), 7).await,
             Err(CheckError::OutputLimit { limit: 7 })
@@ -185,17 +189,20 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_and_missing_program() {
+        let _guard = PROCESS_TEST.lock().await;
         let fake = Fake::new("exec sleep 30");
-        assert!(matches!(
-            run_check(fake.executable(), "x", Duration::from_millis(50), 128).await,
-            Err(CheckError::Timeout)
-        ));
+        let result = run_check(fake.executable(), "x", Duration::from_millis(50), 128).await;
+        assert!(
+            matches!(result, Err(CheckError::Timeout)),
+            "unexpected result: {result:?}"
+        );
         assert!(
             matches!(run_check(fake.0.join("missing"), "x", Duration::from_secs(2), 128).await, Err(CheckError::Spawn(e)) if e.kind() == io::ErrorKind::NotFound)
         );
     }
     #[tokio::test]
     async fn real_compiler_diagnostic_contract() {
+        let _guard = PROCESS_TEST.lock().await;
         let compiler = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../jik/jik");
         if !compiler.is_file() {
             eprintln!(
@@ -226,9 +233,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_kills_child() {
+        let _guard = PROCESS_TEST.lock().await;
         let fake = Fake::new("echo $$ > \"$2\"; exec sleep 30");
         let pidfile = fake.0.join("pid");
-        let task = tokio::spawn(run_check(
+        let mut task = tokio::spawn(run_check(
             fake.executable(),
             pidfile.clone(),
             Duration::from_secs(30),
@@ -237,13 +245,18 @@ mod tests {
         let pid = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(pid) = fs::read_to_string(&pidfile) {
-                    break pid.trim().to_owned();
+                    if !pid.trim().is_empty() {
+                        break pid.trim().to_owned();
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::select! {
+                    result = &mut task => panic!("child exited before writing pid: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
             }
         })
         .await
-        .unwrap();
+        .expect("child did not write pid within deadline");
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         tokio::time::timeout(Duration::from_secs(2), async {

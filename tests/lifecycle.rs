@@ -61,10 +61,6 @@ fn stdio_lifecycle() {
     );
     send(
         &mut input,
-        json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":uri}}}),
-    );
-    send(
-        &mut input,
         json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),
     );
     send(
@@ -135,6 +131,40 @@ fn publishes_compiler_location_and_clears_on_change() {
                 message["params"]["diagnostics"][0]["range"],
                 json!({"start":{"line":0,"character":3},"end":{"line":0,"character":3}})
             );
+            break;
+        }
+    }
+    // A subsequent check that cannot start must clear the previous result.
+    fs::remove_file(&compiler).unwrap();
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":uri}}}),
+    );
+    let clear = receive(&mut output);
+    assert_eq!(clear["method"], "textDocument/publishDiagnostics");
+    assert_eq!(clear["params"]["diagnostics"], json!([]));
+    loop {
+        let message = receive(&mut output);
+        if message["method"] == "window/logMessage" {
+            assert!(message["params"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to spawn"));
+            break;
+        }
+    }
+    fs::write(
+        &compiler,
+        "#!/bin/sh\nprintf 'jik error: bad\\n --> %s:1:6\\n' \"$2\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700)).unwrap();
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":uri}}}),
+    );
+    loop {
+        if receive(&mut output)["method"] == "textDocument/publishDiagnostics" {
             break;
         }
     }
