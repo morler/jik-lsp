@@ -1,0 +1,12 @@
+[package]
+name = "jik-lsp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tower-lsp = "0.20"
+
+[dev-dependencies]
+serde_json = "1"
