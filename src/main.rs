@@ -1,3 +1,7 @@
+#[allow(dead_code)] // The runner is not yet connected to the server.
+mod check;
+#[allow(dead_code)] // The parser is wired into the server in the next diagnostic integration step.
+mod diagnostics;
 mod document;
 mod server;
 
