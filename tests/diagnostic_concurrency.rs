@@ -128,6 +128,23 @@ impl Drop for Harness {
 }
 
 #[test]
+fn invalid_compiler_output_is_reported() {
+    for (script, stream) in [
+        ("printf '\\377'", "stdout"),
+        ("printf '\\377' >&2", "stderr"),
+    ] {
+        let mut h = Harness::new(script);
+        let uri = h.open("entry.jik");
+        h.save(&uri);
+        let expected = format!("jik check {stream} is not UTF-8");
+        h.wait(|message| {
+            assert_ne!(message["method"], "textDocument/publishDiagnostics");
+            message["method"] == "window/logMessage" && message["params"]["message"] == expected
+        });
+    }
+}
+
+#[test]
 fn multiple_entries_merge_and_failure_clears_only_its_own_result() {
     let mut h = Harness::new(
         r#"

@@ -1,5 +1,5 @@
 use crate::{
-    check::run_check,
+    check::{run_check, CheckOutput},
     diagnostics,
     document::{byte_to_position, Documents},
 };
@@ -207,200 +207,16 @@ impl LanguageServer for Backend {
         if let Some(task) = state.tasks.remove(&task_entry) {
             task.abort();
         }
-        let task = tokio::spawn(async move {
-            // Read before and after the compiler runs; unsaved buffers must not receive disk diagnostics.
-            let before = read_open(&snapshot).await;
-            if snapshot.iter().any(|(uri, text)| {
-                uri.to_file_path().is_ok() && before.get(uri).map(|file| &file.text) != Some(text)
-            }) {
-                client
-                    .log_message(
-                        MessageType::WARNING,
-                        "jik check skipped: an open file differs from disk",
-                    )
-                    .await;
-                return;
-            }
-            let output = run_check(executable, &entry, Duration::from_secs(30), 1024 * 1024).await;
-            let after = read_open(&snapshot).await;
-            if before != after {
-                client
-                    .log_message(
-                        MessageType::WARNING,
-                        "jik check discarded: open files changed on disk",
-                    )
-                    .await;
-                return;
-            }
-            let output = match output {
-                Ok(output) => output,
-                Err(error) => {
-                    client
-                        .log_message(MessageType::ERROR, error.to_string())
-                        .await;
-                    return;
-                }
-            };
-            let stdout = match std::str::from_utf8(&output.stdout) {
-                Ok(s) => s,
-                Err(_) => {
-                    client
-                        .log_message(MessageType::ERROR, "jik check stdout is not UTF-8")
-                        .await;
-                    return;
-                }
-            };
-            let stderr = match std::str::from_utf8(&output.stderr) {
-                Ok(s) => s,
-                Err(_) => {
-                    client
-                        .log_message(MessageType::ERROR, "jik check stderr is not UTF-8")
-                        .await;
-                    return;
-                }
-            };
-            let mut parsed = diagnostics::parse(stdout);
-            let other = diagnostics::parse(stderr);
-            parsed.located.extend(other.located);
-            parsed.unlocated.extend(other.unlocated);
-            for message in &parsed.unlocated {
-                client.log_message(MessageType::WARNING, message).await;
-            }
-            if !output.status.success() {
-                client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("jik check failed: {}: {}", output.status, stderr.trim()),
-                    )
-                    .await;
-            }
-            let mut result: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-            for diagnostic in parsed.located {
-                let path = if diagnostic.path.is_absolute() {
-                    diagnostic.path.clone()
-                } else {
-                    match std::env::current_dir() {
-                        Ok(dir) => dir.join(&diagnostic.path),
-                        Err(_) => continue,
-                    }
-                };
-                let Ok(uri) = Url::from_file_path(&path) else {
-                    client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Invalid diagnostic path: {}", path.display()),
-                        )
-                        .await;
-                    continue;
-                };
-                let diagnostic_path = path.clone();
-                let diagnostic_file =
-                    tokio::task::spawn_blocking(move || read_file_snapshot(&diagnostic_path))
-                        .await
-                        .ok()
-                        .flatten();
-                let matching_open: Vec<_> = before
-                    .iter()
-                    .filter(|(_, file)| {
-                        diagnostic_file
-                            .as_ref()
-                            .is_some_and(|other| file.same_identity(other))
-                    })
-                    .map(|(uri, _)| uri.clone())
-                    .collect();
-                let text = if let Some(open_uri) = matching_open.first() {
-                    if !diagnostic_file.as_ref().is_some_and(|file| {
-                        before.get(open_uri).is_some_and(|open| {
-                            file.same_identity(open)
-                                && file.text == open.text
-                                && file.modified == open.modified
-                                && file.same_version(open)
-                        })
-                    }) {
-                        client
-                            .log_message(
-                                MessageType::WARNING,
-                                "jik check discarded: open files changed on disk",
-                            )
-                            .await;
-                        return;
-                    }
-                    snapshot[open_uri].clone()
-                } else {
-                    let source_path = path.clone();
-                    match tokio::task::spawn_blocking(move || std::fs::read_to_string(source_path))
-                        .await
-                    {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(error)) => {
-                            client
-                                .log_message(
-                                    MessageType::WARNING,
-                                    format!("Cannot read {}: {error}", path.display()),
-                                )
-                                .await;
-                            continue;
-                        }
-                        Err(error) => {
-                            client
-                                .log_message(
-                                    MessageType::WARNING,
-                                    format!("Cannot read {}: {error}", path.display()),
-                                )
-                                .await;
-                            continue;
-                        }
-                    }
-                };
-                let Some(position) =
-                    compiler_position(&text, diagnostic.line, diagnostic.byte_column)
-                else {
-                    client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Cannot locate {}: {}", path.display(), diagnostic.message),
-                        )
-                        .await;
-                    continue;
-                };
-                let diagnostic = Diagnostic {
-                    range: Range::new(position, position),
-                    severity: Some(if diagnostic.warning {
-                        DiagnosticSeverity::WARNING
-                    } else {
-                        DiagnosticSeverity::ERROR
-                    }),
-                    source: Some("jik".into()),
-                    message: diagnostic.message,
-                    ..Default::default()
-                };
-                if matching_open.is_empty() {
-                    result.entry(uri).or_default().push(diagnostic);
-                } else {
-                    for open_uri in matching_open {
-                        result.entry(open_uri).or_default().push(diagnostic.clone());
-                    }
-                }
-            }
-            // A failed process with no recognisable diagnostic is not a successful empty check.
-            if !output.status.success() && result.is_empty() {
-                return;
-            }
-            // Check again after resolving diagnostic paths and reading sources.
-            if read_open(&snapshot).await != before {
-                client
-                    .log_message(
-                        MessageType::WARNING,
-                        "jik check discarded: open files changed on disk",
-                    )
-                    .await;
-                return;
-            }
-            let mut state = shared.lock().await;
-            if state.accept_result(entry, epoch, generation, result) {
-                Backend::publish(&client, &mut state).await;
-            }
-        });
+        let job = CheckJob {
+            client,
+            shared,
+            executable,
+            entry,
+            epoch,
+            generation,
+            snapshot,
+        };
+        let task = tokio::spawn(job.run());
         state.tasks.insert(task_entry, task.abort_handle());
     }
     async fn shutdown(&self) -> Result<()> {
@@ -416,6 +232,237 @@ impl LanguageServer for Backend {
     }
 }
 
+struct CheckJob {
+    client: Client,
+    shared: Arc<Mutex<State>>,
+    executable: String,
+    entry: PathBuf,
+    epoch: u64,
+    generation: u64,
+    snapshot: HashMap<Url, String>,
+}
+
+impl CheckJob {
+    async fn run(self) {
+        let Self {
+            client,
+            shared,
+            executable,
+            entry,
+            epoch,
+            generation,
+            snapshot,
+        } = self;
+        // Read before and after the compiler runs; unsaved buffers must not receive disk diagnostics.
+        let before = read_open(&snapshot).await;
+        if snapshot.iter().any(|(uri, text)| {
+            uri.to_file_path().is_ok() && before.get(uri).map(|file| &file.text) != Some(text)
+        }) {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    "jik check skipped: an open file differs from disk",
+                )
+                .await;
+            return;
+        }
+        let output = run_check(executable, &entry, Duration::from_secs(30), 1024 * 1024).await;
+        let after = read_open(&snapshot).await;
+        if before != after {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    "jik check discarded: open files changed on disk",
+                )
+                .await;
+            return;
+        }
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                client
+                    .log_message(MessageType::ERROR, error.to_string())
+                    .await;
+                return;
+            }
+        };
+        let Some(parsed) = parse_check_output(&client, &output).await else {
+            return;
+        };
+        let Some(result) = convert_diagnostics(&client, parsed.located, &snapshot, &before).await
+        else {
+            return;
+        };
+        // A failed process with no recognisable diagnostic is not a successful empty check.
+        if !output.status.success() && result.is_empty() {
+            return;
+        }
+        // Check again after resolving diagnostic paths and reading sources.
+        if read_open(&snapshot).await != before {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    "jik check discarded: open files changed on disk",
+                )
+                .await;
+            return;
+        }
+        let mut state = shared.lock().await;
+        if state.accept_result(entry, epoch, generation, result) {
+            Backend::publish(&client, &mut state).await;
+        }
+    }
+}
+
+async fn parse_check_output(
+    client: &Client,
+    output: &CheckOutput,
+) -> Option<diagnostics::ParsedDiagnostics> {
+    let stdout = decode_output(client, &output.stdout, "stdout").await?;
+    let stderr = decode_output(client, &output.stderr, "stderr").await?;
+    let mut parsed = diagnostics::parse(stdout);
+    let other = diagnostics::parse(stderr);
+    parsed.located.extend(other.located);
+    parsed.unlocated.extend(other.unlocated);
+    for message in &parsed.unlocated {
+        client.log_message(MessageType::WARNING, message).await;
+    }
+    if !output.status.success() {
+        client
+            .log_message(
+                MessageType::ERROR,
+                format!("jik check failed: {}: {}", output.status, stderr.trim()),
+            )
+            .await;
+    }
+    Some(parsed)
+}
+
+async fn decode_output<'a>(client: &Client, bytes: &'a [u8], stream: &str) -> Option<&'a str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("jik check {stream} is not UTF-8"),
+                )
+                .await;
+            None
+        }
+    }
+}
+
+async fn convert_diagnostics(
+    client: &Client,
+    located: Vec<diagnostics::CompilerDiagnostic>,
+    snapshot: &HashMap<Url, String>,
+    before: &HashMap<Url, FileSnapshot>,
+) -> Option<HashMap<Url, Vec<Diagnostic>>> {
+    let mut result: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+    for diagnostic in located {
+        let path = if diagnostic.path.is_absolute() {
+            diagnostic.path.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(dir) => dir.join(&diagnostic.path),
+                Err(_) => continue,
+            }
+        };
+        let Ok(uri) = Url::from_file_path(&path) else {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Invalid diagnostic path: {}", path.display()),
+                )
+                .await;
+            continue;
+        };
+        let diagnostic_path = path.clone();
+        let diagnostic_file =
+            tokio::task::spawn_blocking(move || read_file_snapshot(&diagnostic_path))
+                .await
+                .ok()
+                .flatten();
+        let matching_open: Vec<_> = before
+            .iter()
+            .filter(|(_, file)| {
+                diagnostic_file
+                    .as_ref()
+                    .is_some_and(|other| file.same_identity(other))
+            })
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        let text = if let Some(open_uri) = matching_open.first() {
+            let unchanged = diagnostic_file
+                .as_ref()
+                .zip(before.get(open_uri))
+                .is_some_and(|(file, open)| file.matches_version(open));
+            if !unchanged {
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        "jik check discarded: open files changed on disk",
+                    )
+                    .await;
+                return None;
+            }
+            snapshot[open_uri].clone()
+        } else {
+            let Some(text) = read_diagnostic_source(client, &path).await else {
+                continue;
+            };
+            text
+        };
+        let Some(position) = compiler_position(&text, diagnostic.line, diagnostic.byte_column)
+        else {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Cannot locate {}: {}", path.display(), diagnostic.message),
+                )
+                .await;
+            continue;
+        };
+        let diagnostic = Diagnostic {
+            range: Range::new(position, position),
+            severity: Some(if diagnostic.warning {
+                DiagnosticSeverity::WARNING
+            } else {
+                DiagnosticSeverity::ERROR
+            }),
+            source: Some("jik".into()),
+            message: diagnostic.message,
+            ..Default::default()
+        };
+        if matching_open.is_empty() {
+            result.entry(uri).or_default().push(diagnostic);
+        } else {
+            for open_uri in matching_open {
+                result.entry(open_uri).or_default().push(diagnostic.clone());
+            }
+        }
+    }
+    Some(result)
+}
+
+async fn read_diagnostic_source(client: &Client, path: &std::path::Path) -> Option<String> {
+    let source_path = path.to_owned();
+    let error =
+        match tokio::task::spawn_blocking(move || std::fs::read_to_string(source_path)).await {
+            Ok(Ok(text)) => return Some(text),
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => error.to_string(),
+        };
+    client
+        .log_message(
+            MessageType::WARNING,
+            format!("Cannot read {}: {error}", path.display()),
+        )
+        .await;
+    None
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FileSnapshot {
     text: String,
@@ -426,6 +473,13 @@ struct FileSnapshot {
 }
 
 impl FileSnapshot {
+    fn matches_version(&self, other: &Self) -> bool {
+        self.same_identity(other)
+            && self.text == other.text
+            && self.modified == other.modified
+            && self.same_version(other)
+    }
+
     fn same_version(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {

@@ -66,7 +66,11 @@ pub fn byte_to_position(text: &str, offset: usize) -> Option<Position> {
         return None;
     }
     let bytes = text.as_bytes();
-    if offset > 0 && offset < bytes.len() && bytes[offset - 1] == b'\r' && bytes[offset] == b'\n' {
+    let inside_crlf = offset
+        .checked_sub(1)
+        .and_then(|start| bytes.get(start..=offset))
+        == Some(b"\r\n");
+    if inside_crlf {
         return None;
     }
     let mut line = 0u32;
