@@ -33,6 +33,24 @@ struct State {
     tasks: HashMap<PathBuf, tokio::task::AbortHandle>,
 }
 
+impl State {
+    // Must be called under the same lock as publication and invalidation.
+    fn accept_result(
+        &mut self,
+        entry: PathBuf,
+        epoch: u64,
+        generation: u64,
+        result: HashMap<Url, Vec<Diagnostic>>,
+    ) -> bool {
+        if self.stopped || self.epoch != epoch || self.generations.get(&entry) != Some(&generation)
+        {
+            return false;
+        }
+        self.results.insert(entry, result);
+        true
+    }
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<Mutex<State>>,
@@ -192,10 +210,9 @@ impl LanguageServer for Backend {
         let task = tokio::spawn(async move {
             // Read before and after the compiler runs; unsaved buffers must not receive disk diagnostics.
             let before = read_open(&snapshot).await;
-            if snapshot
-                .iter()
-                .any(|(uri, text)| uri.to_file_path().is_ok() && before.get(uri) != Some(text))
-            {
+            if snapshot.iter().any(|(uri, text)| {
+                uri.to_file_path().is_ok() && before.get(uri).map(|file| &file.text) != Some(text)
+            }) {
                 client
                     .log_message(
                         MessageType::WARNING,
@@ -276,11 +293,39 @@ impl LanguageServer for Backend {
                         .await;
                     continue;
                 };
-                let text = if let Some(open) = snapshot.get(&uri) {
-                    if before.get(&uri) != Some(open) || after.get(&uri) != Some(open) {
-                        continue;
+                let diagnostic_path = path.clone();
+                let diagnostic_file =
+                    tokio::task::spawn_blocking(move || read_file_snapshot(&diagnostic_path))
+                        .await
+                        .ok()
+                        .flatten();
+                let matching_open: Vec<_> = before
+                    .iter()
+                    .filter(|(_, file)| {
+                        diagnostic_file
+                            .as_ref()
+                            .is_some_and(|other| file.same_identity(other))
+                    })
+                    .map(|(uri, _)| uri.clone())
+                    .collect();
+                let text = if let Some(open_uri) = matching_open.first() {
+                    if !diagnostic_file.as_ref().is_some_and(|file| {
+                        before.get(open_uri).is_some_and(|open| {
+                            file.same_identity(open)
+                                && file.text == open.text
+                                && file.modified == open.modified
+                                && file.same_version(open)
+                        })
+                    }) {
+                        client
+                            .log_message(
+                                MessageType::WARNING,
+                                "jik check discarded: open files changed on disk",
+                            )
+                            .await;
+                        return;
                     }
-                    open.clone()
+                    snapshot[open_uri].clone()
                 } else {
                     let source_path = path.clone();
                     match tokio::task::spawn_blocking(move || std::fs::read_to_string(source_path))
@@ -318,7 +363,7 @@ impl LanguageServer for Backend {
                         .await;
                     continue;
                 };
-                result.entry(uri).or_default().push(Diagnostic {
+                let diagnostic = Diagnostic {
                     range: Range::new(position, position),
                     severity: Some(if diagnostic.warning {
                         DiagnosticSeverity::WARNING
@@ -328,21 +373,33 @@ impl LanguageServer for Backend {
                     source: Some("jik".into()),
                     message: diagnostic.message,
                     ..Default::default()
-                });
+                };
+                if matching_open.is_empty() {
+                    result.entry(uri).or_default().push(diagnostic);
+                } else {
+                    for open_uri in matching_open {
+                        result.entry(open_uri).or_default().push(diagnostic.clone());
+                    }
+                }
             }
             // A failed process with no recognisable diagnostic is not a successful empty check.
             if !output.status.success() && result.is_empty() {
                 return;
             }
-            let mut state = shared.lock().await;
-            if state.stopped
-                || state.epoch != epoch
-                || state.generations.get(&entry) != Some(&generation)
-            {
+            // Check again after resolving diagnostic paths and reading sources.
+            if read_open(&snapshot).await != before {
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        "jik check discarded: open files changed on disk",
+                    )
+                    .await;
                 return;
             }
-            state.results.insert(entry, result);
-            Backend::publish(&client, &mut state).await;
+            let mut state = shared.lock().await;
+            if state.accept_result(entry, epoch, generation, result) {
+                Backend::publish(&client, &mut state).await;
+            }
         });
         state.tasks.insert(task_entry, task.abort_handle());
     }
@@ -359,13 +416,83 @@ impl LanguageServer for Backend {
     }
 }
 
-async fn read_open(snapshot: &HashMap<Url, String>) -> HashMap<Url, String> {
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    text: String,
+    canonical: PathBuf,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl FileSnapshot {
+    fn same_version(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.identity == other.identity
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            true
+        }
+    }
+
+    fn same_identity(&self, other: &Self) -> bool {
+        if self.canonical == other.canonical {
+            return true;
+        }
+        #[cfg(unix)]
+        if self.identity.0 == other.identity.0 && self.identity.1 == other.identity.1 {
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct SnapshotMetadata {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn read_file_snapshot(path: &std::path::Path) -> Option<FileSnapshot> {
+    fn metadata(path: &std::path::Path) -> Option<SnapshotMetadata> {
+        let info = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(SnapshotMetadata {
+            modified: info.modified().ok()?,
+            len: info.len(),
+            #[cfg(unix)]
+            identity: (info.dev(), info.ino(), info.ctime(), info.ctime_nsec()),
+        })
+    }
+    let before = metadata(path)?;
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let after = metadata(path)?;
+    if before != after || canonical != std::fs::canonicalize(path).ok()? {
+        return None;
+    }
+    Some(FileSnapshot {
+        text,
+        canonical,
+        modified: after.modified,
+        #[cfg(unix)]
+        identity: after.identity,
+    })
+}
+
+async fn read_open(snapshot: &HashMap<Url, String>) -> HashMap<Url, FileSnapshot> {
     let uris: Vec<_> = snapshot.keys().cloned().collect();
     tokio::task::spawn_blocking(move || {
         uris.into_iter()
             .filter_map(|uri| {
-                let text = std::fs::read_to_string(uri.to_file_path().ok()?).ok()?;
-                Some((uri, text))
+                let file = read_file_snapshot(&uri.to_file_path().ok()?)?;
+                Some((uri, file))
             })
             .collect()
     })
@@ -410,6 +537,49 @@ fn compiler_position(
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::Position;
+
+    #[tokio::test]
+    async fn late_uncancellable_results_cannot_replace_newer_results() {
+        let entry = PathBuf::from("/entry.jik");
+        let uri = Url::parse("file:///entry.jik").unwrap();
+        let state = Arc::new(Mutex::new(State::default()));
+        state.lock().await.generations.insert(entry.clone(), 1);
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let old_state = state.clone();
+        let old_entry = entry.clone();
+        let old_uri = uri.clone();
+        let old = tokio::spawn(async move {
+            blocked.await.unwrap();
+            let mut result = HashMap::new();
+            result.insert(
+                old_uri,
+                vec![Diagnostic::new_simple(Range::default(), "stale".into())],
+            );
+            old_state
+                .lock()
+                .await
+                .accept_result(old_entry, 0, 1, result)
+        });
+        {
+            let mut current = state.lock().await;
+            current.generations.insert(entry.clone(), 2);
+            let mut result = HashMap::new();
+            result.insert(
+                uri.clone(),
+                vec![Diagnostic::new_simple(Range::default(), "fresh".into())],
+            );
+            assert!(current.accept_result(entry.clone(), 0, 2, result));
+        }
+        release.send(()).unwrap();
+        assert!(!old.await.unwrap());
+        let mut current = state.lock().await;
+        assert_eq!(current.results[&entry][&uri][0].message, "fresh");
+        current.epoch += 1;
+        assert!(!current.accept_result(entry.clone(), 0, 2, HashMap::new()));
+        current.stopped = true;
+        let epoch = current.epoch;
+        assert!(!current.accept_result(entry, epoch, 2, HashMap::new()));
+    }
 
     #[test]
     fn compiler_columns_are_checked_utf8_bytes() {

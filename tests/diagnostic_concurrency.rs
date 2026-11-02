@@ -180,6 +180,48 @@ fn unsaved_open_buffer_skips_check() {
 }
 
 #[test]
+fn compiler_path_alias_publishes_to_open_uri() {
+    use std::os::unix::fs::symlink;
+    let mut h = Harness::new(
+        "printf 'jik error: symlink\\n --> %s/alias.jik:1:1\\njik error: hardlink\\n --> %s/hard.jik:1:1\\n' \"${0%/*}\" \"${0%/*}\" >&2; exit 1",
+    );
+    let uri = h.open("entry.jik");
+    symlink(h.dir.join("entry.jik"), h.dir.join("alias.jik")).unwrap();
+    fs::hard_link(h.dir.join("entry.jik"), h.dir.join("hard.jik")).unwrap();
+    h.save(&uri);
+    let diagnostic = h.diagnostics(&uri, 2);
+    let diagnostics = diagnostic["params"]["diagnostics"].as_array().unwrap();
+    assert!(diagnostics.iter().any(|d| d["message"] == "symlink"));
+    assert!(diagnostics.iter().any(|d| d["message"] == "hardlink"));
+}
+
+#[test]
+fn disk_change_then_restore_discards_result() {
+    let mut h = Harness::new(
+        r#"
+dir=${0%/*}
+: > "$dir/started"
+while [ ! -f "$dir/release" ]; do :; done
+printf 'jik error: obsolete\n --> %s:1:1\n' "$2" >&2
+exit 1
+"#,
+    );
+    let uri = h.open("entry.jik");
+    h.save(&uri);
+    h.wait_file("started");
+    fs::write(h.dir.join("entry.jik"), "changed externally\n").unwrap();
+    fs::write(h.dir.join("entry.jik"), "source\n").unwrap();
+    fs::write(h.dir.join("release"), "").unwrap();
+    h.wait(|m| {
+        assert_ne!(m["method"], "textDocument/publishDiagnostics");
+        m["method"] == "window/logMessage"
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("open files changed on disk"))
+    });
+}
+
+#[test]
 fn disk_change_during_check_discards_result() {
     let mut h = Harness::new(
         r#"
