@@ -12,11 +12,11 @@ use std::{
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, MessageType, Range, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Url,
+    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    InitializeParams, InitializeResult, InitializedParams, MessageType, Range, Registration,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -30,6 +30,7 @@ struct State {
     results: HashMap<PathBuf, HashMap<Url, Vec<Diagnostic>>>,
     published: HashSet<Url>,
     stopped: bool,
+    watch_files: bool,
     tasks: HashMap<PathBuf, tokio::task::AbortHandle>,
 }
 
@@ -102,6 +103,36 @@ impl Backend {
         let _ = uri;
         Self::publish(&self.client, state).await;
     }
+
+    /// Supersede any in-flight check for `entry` with a new one. Callers own the
+    /// state lock and drop this entry's previous result before calling.
+    async fn start_check(&self, state: &mut State, entry: PathBuf) {
+        state.results.remove(&entry);
+        Self::publish(&self.client, state).await;
+        let generation = state.generations.entry(entry.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+        let generation = *generation;
+        let epoch = state.epoch;
+        let executable = state.executable.clone().unwrap_or_else(|| "jik".into());
+        let snapshot = state.documents.texts();
+        let shared = self.state.clone();
+        let client = self.client.clone();
+        let task_entry = entry.clone();
+        if let Some(task) = state.tasks.remove(&task_entry) {
+            task.abort();
+        }
+        let job = CheckJob {
+            client,
+            shared,
+            executable,
+            entry,
+            epoch,
+            generation,
+            snapshot,
+        };
+        let task = tokio::spawn(job.run());
+        state.tasks.insert(task_entry, task.abort_handle());
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -128,6 +159,13 @@ impl LanguageServer for Backend {
         };
         state.executable = Some(get_string("jikPath")?.unwrap_or_else(|| "jik".into()));
         state.entry = get_string("entryPath")?.map(PathBuf::from);
+        state.watch_files = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|capability| capability.dynamic_registration)
+            .unwrap_or(false);
         if state.entry.as_ref().is_some_and(|p| !p.is_absolute()) {
             return Err(Error::invalid_params("entryPath must be absolute"));
         }
@@ -149,7 +187,46 @@ impl LanguageServer for Backend {
             }),
         })
     }
-    async fn initialized(&self, _: InitializedParams) {}
+    async fn initialized(&self, _: InitializedParams) {
+        if !self.state.lock().await.watch_files {
+            return;
+        }
+        let registration = Registration {
+            id: "jik-file-watcher".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: Some(serde_json::json!({
+                "watchers": [{"globPattern": "**/*.jik"}]
+            })),
+        };
+        if let Err(error) = self.client.register_capability(vec![registration]).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Cannot watch Jik files: {error}"),
+                )
+                .await;
+        }
+    }
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        if params.changes.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if state.stopped {
+            return;
+        }
+        // Re-check instead of only clearing: a watcher event may report our own
+        // save and arrive after the save-triggered check has started, so clearing
+        // alone would cancel a valid check. Without a configured entry, re-check
+        // every entry that has been checked; unrelated files cannot be checked.
+        let entries: Vec<_> = match &state.entry {
+            Some(entry) => vec![entry.clone()],
+            None => state.generations.keys().cloned().collect(),
+        };
+        for entry in entries {
+            self.start_check(&mut state, entry).await;
+        }
+    }
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         let mut state = self.state.lock().await;
@@ -193,31 +270,7 @@ impl LanguageServer for Backend {
                 return;
             }
         };
-        state.results.remove(&entry);
-        Self::publish(&self.client, &mut state).await;
-        let generation = state.generations.entry(entry.clone()).or_default();
-        *generation = generation.wrapping_add(1);
-        let generation = *generation;
-        let epoch = state.epoch;
-        let executable = state.executable.clone().unwrap_or_else(|| "jik".into());
-        let snapshot = state.documents.texts();
-        let shared = self.state.clone();
-        let client = self.client.clone();
-        let task_entry = entry.clone();
-        if let Some(task) = state.tasks.remove(&task_entry) {
-            task.abort();
-        }
-        let job = CheckJob {
-            client,
-            shared,
-            executable,
-            entry,
-            epoch,
-            generation,
-            snapshot,
-        };
-        let task = tokio::spawn(job.run());
-        state.tasks.insert(task_entry, task.abort_handle());
+        self.start_check(&mut state, entry).await;
     }
     async fn shutdown(&self) -> Result<()> {
         let mut state = self.state.lock().await;

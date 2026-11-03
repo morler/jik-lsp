@@ -22,10 +22,15 @@ struct Harness {
     child: Child,
     input: ChildStdin,
     messages: mpsc::Receiver<Value>,
+    registration: Option<Value>,
 }
 
 impl Harness {
     fn new(script: &str) -> Self {
+        Self::with(&json!({}), None, script)
+    }
+
+    fn with(capabilities: &Value, entry: Option<&std::path::Path>, script: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "jik-lsp-concurrency-{}-{}",
             std::process::id(),
@@ -69,10 +74,20 @@ impl Harness {
             child,
             input,
             messages,
+            registration: None,
         };
-        this.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{},"initializationOptions":{"jikPath":compiler}}}));
+        let mut options = json!({"jikPath": compiler});
+        if let Some(entry) = entry {
+            options["entryPath"] = json!(entry);
+        }
+        this.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":capabilities,"initializationOptions":options}}));
         this.wait(|m| m["id"] == 1);
         this.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+        if capabilities["workspace"]["didChangeWatchedFiles"]["dynamicRegistration"] == true {
+            let request = this.wait(|m| m["method"] == "client/registerCapability");
+            this.send(json!({"jsonrpc":"2.0","id":request["id"],"result":null}));
+            this.registration = Some(request);
+        }
         this
     }
     fn send(&mut self, message: Value) {
@@ -294,4 +309,55 @@ exit 1
             break;
         }
     }
+}
+
+#[test]
+fn watcher_registration_is_dynamic_and_optional() {
+    let h = Harness::with(
+        &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
+        None,
+        ":",
+    );
+    let request = h.registration.as_ref().expect("watcher was not registered");
+    let registration = &request["params"]["registrations"][0];
+    assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+    assert_eq!(
+        registration["registerOptions"]["watchers"][0]["globPattern"],
+        "**/*.jik"
+    );
+    let mut plain = Harness::new(":");
+    plain.open("entry.jik");
+    plain.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));
+    loop {
+        let message = plain.messages.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(message["method"], "client/registerCapability");
+        if message["id"] == 3 {
+            break;
+        }
+    }
+}
+
+#[test]
+fn watcher_change_rechecks_instead_of_clearing_valid_result() {
+    let mut h = Harness::with(
+        &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
+        None,
+        r#"
+dir=${0%/*}
+if [ -f "$dir/second" ]; then
+  printf 'jik error: second\n --> %s:1:1\n' "$2" >&2
+else
+  printf 'jik error: first\n --> %s:1:1\n' "$2" >&2
+fi
+exit 1
+"#,
+    );
+    let uri = h.open("entry.jik");
+    h.save(&uri);
+    let first = h.diagnostics(&uri, 1);
+    assert_eq!(first["params"]["diagnostics"][0]["message"], "first");
+    fs::write(h.dir.join("second"), "").unwrap();
+    h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":uri,"type":2}]}}));
+    let second = h.diagnostics(&uri, 1);
+    assert_eq!(second["params"]["diagnostics"][0]["message"], "second");
 }
