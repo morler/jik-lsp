@@ -297,7 +297,9 @@ impl CheckJob {
         if !output.status.success() && result.is_empty() {
             return;
         }
-        // Check again after resolving diagnostic paths and reading sources.
+        // Hold the state lock while rechecking so waiting for publication cannot
+        // widen the window between the final disk snapshot and publication.
+        let mut state = shared.lock().await;
         if read_open(&snapshot).await != before {
             client
                 .log_message(
@@ -307,7 +309,6 @@ impl CheckJob {
                 .await;
             return;
         }
-        let mut state = shared.lock().await;
         if state.accept_result(entry, epoch, generation, result) {
             Backend::publish(&client, &mut state).await;
         }
