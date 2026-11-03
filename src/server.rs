@@ -32,6 +32,8 @@ struct State {
     stopped: bool,
     watch_files: bool,
     tasks: HashMap<PathBuf, tokio::task::AbortHandle>,
+    /// When the newest check for an entry was started.
+    started: HashMap<PathBuf, std::time::SystemTime>,
 }
 
 impl State {
@@ -100,18 +102,21 @@ impl Backend {
         }
         // Any open source may affect diagnostics in any entry through imports.
         state.results.clear();
+        state.started.clear();
         let _ = uri;
         Self::publish(&self.client, state).await;
     }
 
     /// Supersede any in-flight check for `entry` with a new one. Callers own the
-    /// state lock and drop this entry's previous result before calling.
+    /// state lock and are responsible for clearing this entry's old result and
+    /// publishing once; this only bumps the generation and spawns the job.
     async fn start_check(&self, state: &mut State, entry: PathBuf) {
-        state.results.remove(&entry);
-        Self::publish(&self.client, state).await;
         let generation = state.generations.entry(entry.clone()).or_default();
         *generation = generation.wrapping_add(1);
         let generation = *generation;
+        state
+            .started
+            .insert(entry.clone(), std::time::SystemTime::now());
         let epoch = state.epoch;
         let executable = state.executable.clone().unwrap_or_else(|| "jik".into());
         let snapshot = state.documents.texts();
@@ -215,14 +220,43 @@ impl LanguageServer for Backend {
         if state.stopped {
             return;
         }
-        // Re-check instead of only clearing: a watcher event may report our own
-        // save and arrive after the save-triggered check has started, so clearing
-        // alone would cancel a valid check. Without a configured entry, re-check
-        // every entry that has been checked; unrelated files cannot be checked.
-        let entries: Vec<_> = match &state.entry {
-            Some(entry) => vec![entry.clone()],
+        // A client may echo our own save back as a watched-file event. When every
+        // reported file is the configured entry and its timestamp is not newer
+        // than the check that save already started, that check sees the same
+        // content and a second compiler run would be pure duplication. Deleted or
+        // missing files, dependencies and unconfigured entrysets always re-check.
+        if let Some(entry) = state.entry.clone() {
+            let started = state.started.get(&entry).copied();
+            let saved = std::fs::metadata(&entry)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            let echo = started.is_some()
+                && params
+                    .changes
+                    .iter()
+                    .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()))
+                && saved.is_some_and(|saved| saved <= started.unwrap_or(saved));
+            if echo {
+                return;
+            }
+        }
+        // Forget entries whose document is gone instead of keeping them forever.
+        let open = state.documents.paths();
+        let configured = state.entry.clone();
+        state
+            .generations
+            .retain(|entry, _| configured.as_ref() == Some(entry) || open.contains(entry));
+        let entries: Vec<_> = match configured {
+            Some(entry) => vec![entry],
             None => state.generations.keys().cloned().collect(),
         };
+        if entries.is_empty() {
+            return;
+        }
+        for entry in &entries {
+            state.results.remove(entry);
+        }
+        Self::publish(&self.client, &mut state).await;
         for entry in entries {
             self.start_check(&mut state, entry).await;
         }
@@ -251,9 +285,20 @@ impl LanguageServer for Backend {
     }
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let mut state = self.state.lock().await;
-        if state.documents.close(&params.text_document.uri) {
-            self.invalidate(&mut state, &params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        if !state.documents.close(&uri) {
+            return;
         }
+        // Forget per-entry bookkeeping for a closed document, so it is neither
+        // re-checked by later watcher events nor kept forever.
+        if let Ok(path) = uri.to_file_path() {
+            if state.entry.as_ref() != Some(&path) {
+                state.generations.remove(&path);
+                state.results.remove(&path);
+                state.started.remove(&path);
+            }
+        }
+        self.invalidate(&mut state, &uri).await;
     }
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let mut state = self.state.lock().await;
@@ -270,6 +315,8 @@ impl LanguageServer for Backend {
                 return;
             }
         };
+        state.results.remove(&entry);
+        Self::publish(&self.client, &mut state).await;
         self.start_check(&mut state, entry).await;
     }
     async fn shutdown(&self) -> Result<()> {
@@ -280,6 +327,7 @@ impl LanguageServer for Backend {
         }
         state.epoch = state.epoch.wrapping_add(1);
         state.results.clear();
+        state.started.clear();
         Self::publish(&self.client, &mut state).await;
         Ok(())
     }
@@ -297,6 +345,13 @@ struct CheckJob {
 
 impl CheckJob {
     async fn run(self) {
+        let entry = self.entry.clone();
+        let shared = self.shared.clone();
+        self.check().await;
+        shared.lock().await.tasks.remove(&entry);
+    }
+
+    async fn check(self) {
         let Self {
             client,
             shared,
@@ -350,9 +405,9 @@ impl CheckJob {
         if !output.status.success() && result.is_empty() {
             return;
         }
-        // Hold the state lock while rechecking so waiting for publication cannot
-        // widen the window between the final disk snapshot and publication.
-        let mut state = shared.lock().await;
+        // Re-read before taking the lock: concurrent buffer changes are already
+        // rejected through the epoch/generation check in `accept_result`, and
+        // holding the lock across file I/O would stall every other request.
         if read_open(&snapshot).await != before {
             client
                 .log_message(
@@ -362,6 +417,7 @@ impl CheckJob {
                 .await;
             return;
         }
+        let mut state = shared.lock().await;
         if state.accept_result(entry, epoch, generation, result) {
             Backend::publish(&client, &mut state).await;
         }

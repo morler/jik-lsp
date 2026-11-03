@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use tower_lsp::lsp_types::{Position, Url};
 
 #[derive(Debug)]
@@ -16,6 +17,14 @@ impl Documents {
         self.0
             .iter()
             .map(|(uri, doc)| (uri.clone(), doc.text.clone()))
+            .collect()
+    }
+
+    /// File paths of the open documents that have one.
+    pub fn paths(&self) -> HashSet<PathBuf> {
+        self.0
+            .keys()
+            .filter_map(|uri| uri.to_file_path().ok())
             .collect()
     }
 

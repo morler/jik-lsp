@@ -96,12 +96,16 @@ impl Harness {
         self.input.flush().unwrap();
     }
     fn wait(&self, predicate: impl Fn(&Value) -> bool) -> Value {
+        let debug = std::env::var_os("JIK_LSP_DEBUG_MSGS").is_some();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let message = self
                 .messages
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("timed out waiting for LSP message");
+                .unwrap_or_else(|error| panic!("timed out waiting for LSP message: {error:?}"));
+            if debug {
+                eprintln!("recv {}", message);
+            }
             if predicate(&message) {
                 return message;
             }
@@ -360,4 +364,38 @@ exit 1
     h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":uri,"type":2}]}}));
     let second = h.diagnostics(&uri, 1);
     assert_eq!(second["params"]["diagnostics"][0]["message"], "second");
+}
+
+#[test]
+fn watcher_change_rechecks_configured_entry() {
+    let entry = std::env::temp_dir().join(format!(
+        "jik-lsp-concurrency-entry-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut h = Harness::with(
+        &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
+        Some(&entry),
+        r#"
+dir=${0%/*}
+if [ -f "$dir/second" ]; then
+  printf 'jik error: second\n --> %s:1:1\n' "$2" >&2
+else
+  printf 'jik error: first\n --> %s:1:1\n' "$2" >&2
+fi
+exit 1
+"#,
+    );
+    fs::write(&entry, "source\n").unwrap();
+    let uri = Url::from_file_path(&entry).unwrap().to_string();
+    h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
+    let other = h.open("other.jik");
+    h.save(&uri);
+    let first = h.diagnostics(&uri, 1);
+    assert_eq!(first["params"]["diagnostics"][0]["message"], "first");
+    fs::write(h.dir.join("second"), "").unwrap();
+    h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":other,"type":2}]}}));
+    let second = h.diagnostics(&uri, 1);
+    assert_eq!(second["params"]["diagnostics"][0]["message"], "second");
+    let _ = fs::remove_file(&entry);
 }
