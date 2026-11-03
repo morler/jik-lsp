@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: deferred
 created_at: 2026-11-02T08:52:47Z
-updated_at: 2026-11-03T03:19:39Z
+updated_at: 2026-11-03T08:42:52Z
 ---
 
 原型已记录限制：符号链接等路径别名可能绕过打开文档匹配；检查前后快照无法检测期间改动后恢复、未打开文件变动或检查后到发布前的磁盘修改。设计可靠的文件身份和快照策略，并添加回归测试。
@@ -15,3 +15,5 @@ updated_at: 2026-11-03T03:19:39Z
 进一步收窄发布前竞态窗口：获取状态锁后再复查已打开文件快照，避免等待状态锁扩大最终复查与发布之间的时间间隔。复查期间持锁可能延迟其他文档事件；外部文件仍可在复查后修改，未打开依赖仍无法验证。现有测试通过，尚无针对等待锁期间磁盘变更的确定性回归测试。
 
 ocr 评审（会话 1bde634e）指出：把 read_open 复查移入状态锁无防护收益（并发变更已由 epoch/generation 拦截），却让文件 I/O 阻塞 did_open/change/save/watcher。已在 b3c865d 回滚，锁恢复为只包住 accept_result + publish。
+
+收尾（本轮）：保存回声判定从「修改时间 <= 检查启动时间」改为内容比对——`State.started` 换成 `State.checking`，保存时在 `spawn_blocking` 中读取入口快照；watcher 事件只有在入口内容与快照一致（`same_identity` 加文本相同，忽略时间戳）时才视为回声，消除时间戳精度不足导致的误判。`CheckJob::check` 改为在解析编译器输出前先重读已打开文件，使「文件已变更」的告警不会被同一批过期输出引发的 jik 失败/非 UTF-8 日志覆盖。新增回归测试 `echo_of_own_save_does_not_start_second_check`（回声不触发第二次编译）与 `replaced_entry_with_same_content_still_rechecks`（内容变化且时间戳被回拨时仍重检）。未打开的依赖与最终复查到发布之间的竞态需要编译器协作或不可变输入快照，已在 README 中明确归因。

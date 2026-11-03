@@ -367,6 +367,84 @@ exit 1
 }
 
 #[test]
+fn echo_of_own_save_does_not_start_second_check() {
+    let entry = std::env::temp_dir().join(format!(
+        "jik-lsp-concurrency-echo-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut h = Harness::with(
+        &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
+        Some(&entry),
+        r#"
+dir=${0%/*}
+echo x >> "$dir/runs"
+printf 'jik error: only\n --> %s:1:1\n' "$2" >&2
+exit 1
+"#,
+    );
+    fs::write(&entry, "source\n").unwrap();
+    let uri = Url::from_file_path(&entry).unwrap().to_string();
+    h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
+    h.save(&uri);
+    let diagnostic = h.diagnostics(&uri, 1);
+    assert_eq!(diagnostic["params"]["diagnostics"][0]["message"], "only");
+    // The client echoes the save as a watched-file event while the entry still
+    // holds the content the finished check read: no second compiler run.
+    h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":uri,"type":2}]}}));
+    h.send(json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
+    h.wait(|m| m["id"] == 9);
+    let runs = fs::read_to_string(h.dir.join("runs")).unwrap_or_default();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "watcher echo started a second check"
+    );
+    let _ = fs::remove_file(&entry);
+}
+
+#[test]
+fn replaced_entry_with_same_content_still_rechecks() {
+    let entry = std::env::temp_dir().join(format!(
+        "jik-lsp-concurrency-replace-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut h = Harness::with(
+        &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
+        Some(&entry),
+        r#"
+dir=${0%/*}
+echo x >> "$dir/runs"
+printf 'jik error: only\n --> %s:1:1\n' "$2" >&2
+exit 1
+"#,
+    );
+    fs::write(&entry, "source\n").unwrap();
+    let uri = Url::from_file_path(&entry).unwrap().to_string();
+    h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
+    h.save(&uri);
+    h.diagnostics(&uri, 1);
+    // Same file name, different content, older modification time: an echo is
+    // decided by content, so the watcher event must still trigger a re-check
+    // (which then reports that the open buffer differs from disk).
+    fs::write(&entry, "changed externally\n").unwrap();
+    Command::new("touch")
+        .args(["-t", "197001010000.00"])
+        .arg(&entry)
+        .status()
+        .unwrap();
+    h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":uri,"type":2}]}}));
+    h.wait(|m| {
+        m["method"] == "window/logMessage"
+            && m["params"]["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("open file differs from disk"))
+    });
+    let _ = fs::remove_file(&entry);
+}
+
+#[test]
 fn watcher_change_rechecks_configured_entry() {
     let entry = std::env::temp_dir().join(format!(
         "jik-lsp-concurrency-entry-{}-{}",

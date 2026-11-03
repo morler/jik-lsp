@@ -32,8 +32,10 @@ struct State {
     stopped: bool,
     watch_files: bool,
     tasks: HashMap<PathBuf, tokio::task::AbortHandle>,
-    /// When the newest check for an entry was started.
-    started: HashMap<PathBuf, std::time::SystemTime>,
+    /// The entry's on-disk content when its newest check was started, used to
+    /// recognise a client echo of our own save without relying on timestamps.
+    /// `None` when the file could not be read, which never matches an echo.
+    checking: HashMap<PathBuf, Option<FileSnapshot>>,
 }
 
 impl State {
@@ -102,7 +104,7 @@ impl Backend {
         }
         // Any open source may affect diagnostics in any entry through imports.
         state.results.clear();
-        state.started.clear();
+        state.checking.clear();
         let _ = uri;
         Self::publish(&self.client, state).await;
     }
@@ -114,9 +116,13 @@ impl Backend {
         let generation = state.generations.entry(entry.clone()).or_default();
         *generation = generation.wrapping_add(1);
         let generation = *generation;
-        state
-            .started
-            .insert(entry.clone(), std::time::SystemTime::now());
+        // Read off the runtime thread: this snapshot decides whether a later
+        // watcher event is merely the client echoing this save.
+        let start_path = entry.clone();
+        let start = tokio::task::spawn_blocking(move || read_file_snapshot(&start_path))
+            .await
+            .unwrap_or(None);
+        state.checking.insert(entry.clone(), start);
         let epoch = state.epoch;
         let executable = state.executable.clone().unwrap_or_else(|| "jik".into());
         let snapshot = state.documents.texts();
@@ -221,21 +227,26 @@ impl LanguageServer for Backend {
             return;
         }
         // A client may echo our own save back as a watched-file event. When every
-        // reported file is the configured entry and its timestamp is not newer
-        // than the check that save already started, that check sees the same
-        // content and a second compiler run would be pure duplication. Deleted or
-        // missing files, dependencies and unconfigured entrysets always re-check.
+        // reported file is the configured entry and it still holds the content the
+        // running check is reading, that check covers this event and a second
+        // compiler run would be pure duplication. Content is compared instead of
+        // timestamps, whose granularity is not reliable enough to order a save and
+        // the echo it produces. Deleted or missing files, dependencies and
+        // unconfigured entrysets always re-check.
         if let Some(entry) = state.entry.clone() {
-            let started = state.started.get(&entry).copied();
-            let saved = std::fs::metadata(&entry)
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            let echo = started.is_some()
-                && params
-                    .changes
-                    .iter()
-                    .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()))
-                && saved.is_some_and(|saved| saved <= started.unwrap_or(saved));
+            let only_entry = params
+                .changes
+                .iter()
+                .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()));
+            let echo = only_entry
+                && state
+                    .checking
+                    .get(&entry)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|start| {
+                        read_file_snapshot(&entry)
+                            .is_some_and(|current| current.same_contents(start))
+                    });
             if echo {
                 return;
             }
@@ -295,7 +306,7 @@ impl LanguageServer for Backend {
             if state.entry.as_ref() != Some(&path) {
                 state.generations.remove(&path);
                 state.results.remove(&path);
-                state.started.remove(&path);
+                state.checking.remove(&path);
             }
         }
         self.invalidate(&mut state, &uri).await;
@@ -327,7 +338,7 @@ impl LanguageServer for Backend {
         }
         state.epoch = state.epoch.wrapping_add(1);
         state.results.clear();
-        state.started.clear();
+        state.checking.clear();
         Self::publish(&self.client, &mut state).await;
         Ok(())
     }
@@ -376,35 +387,35 @@ impl CheckJob {
         }
         let output = run_check(executable, &entry, Duration::from_secs(30), 1024 * 1024).await;
         let after = read_open(&snapshot).await;
-        if before != after {
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    "jik check discarded: open files changed on disk",
-                )
-                .await;
-            return;
-        }
-        let output = match output {
-            Ok(output) => output,
-            Err(error) => {
-                client
-                    .log_message(MessageType::ERROR, error.to_string())
-                    .await;
+        let pending = if before == after {
+            // Read the current state once before parsing: the latest possible read
+            // is priced in, and a changed file can no longer overwrite the warning
+            // with "jik check failed" or "is not UTF-8" errors from stale output.
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    client
+                        .log_message(MessageType::ERROR, error.to_string())
+                        .await;
+                    return;
+                }
+            };
+            let Some(parsed) = parse_check_output(&client, &output).await else {
+                return;
+            };
+            let Some(result) =
+                convert_diagnostics(&client, parsed.located, &snapshot, &before).await
+            else {
+                return;
+            };
+            // A failed process with no recognisable diagnostic is not a successful empty check.
+            if !output.status.success() && result.is_empty() {
                 return;
             }
+            Some(result)
+        } else {
+            None
         };
-        let Some(parsed) = parse_check_output(&client, &output).await else {
-            return;
-        };
-        let Some(result) = convert_diagnostics(&client, parsed.located, &snapshot, &before).await
-        else {
-            return;
-        };
-        // A failed process with no recognisable diagnostic is not a successful empty check.
-        if !output.status.success() && result.is_empty() {
-            return;
-        }
         // Re-read before taking the lock: concurrent buffer changes are already
         // rejected through the epoch/generation check in `accept_result`, and
         // holding the lock across file I/O would stall every other request.
@@ -417,6 +428,15 @@ impl CheckJob {
                 .await;
             return;
         }
+        let Some(result) = pending else {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    "jik check discarded: open files changed on disk",
+                )
+                .await;
+            return;
+        };
         let mut state = shared.lock().await;
         if state.accept_result(entry, epoch, generation, result) {
             Backend::publish(&client, &mut state).await;
@@ -588,6 +608,13 @@ impl FileSnapshot {
             && self.text == other.text
             && self.modified == other.modified
             && self.same_version(other)
+    }
+
+    /// Content alone, deliberately ignoring timestamps: a client echo of our own
+    /// save can carry an equal or even older modification time, so identity plus
+    /// text is what decides whether the running check already covers the file.
+    fn same_contents(&self, other: &Self) -> bool {
+        self.same_identity(other) && self.text == other.text
     }
 
     fn same_version(&self, other: &Self) -> bool {
