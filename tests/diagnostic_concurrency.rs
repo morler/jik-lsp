@@ -421,6 +421,7 @@ fn echo_of_own_save_does_not_start_second_check() {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    fs::write(&entry, "source\n").unwrap();
     let mut h = Harness::with(
         &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
         Some(&entry),
@@ -431,7 +432,6 @@ printf 'jik error: only\n --> %s:1:1\n' "$2" >&2
 exit 1
 "#,
     );
-    fs::write(&entry, "source\n").unwrap();
     let uri = Url::from_file_path(&entry).unwrap().to_string();
     h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
     h.save(&uri);
@@ -475,6 +475,7 @@ fn replaced_entry_with_same_content_still_rechecks() {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    fs::write(&entry, "source\n").unwrap();
     let mut h = Harness::with(
         &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
         Some(&entry),
@@ -485,7 +486,6 @@ printf 'jik error: only\n --> %s:1:1\n' "$2" >&2
 exit 1
 "#,
     );
-    fs::write(&entry, "source\n").unwrap();
     let uri = Url::from_file_path(&entry).unwrap().to_string();
     h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
     h.save(&uri);
@@ -516,6 +516,7 @@ fn watcher_change_rechecks_configured_entry() {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    fs::write(&entry, "source\n").unwrap();
     let mut h = Harness::with(
         &json!({"workspace": {"didChangeWatchedFiles": {"dynamicRegistration": true}}}),
         Some(&entry),
@@ -529,7 +530,6 @@ fi
 exit 1
 "#,
     );
-    fs::write(&entry, "source\n").unwrap();
     let uri = Url::from_file_path(&entry).unwrap().to_string();
     h.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"jik","version":1,"text":"source\n"}}}));
     let other = h.open("other.jik");

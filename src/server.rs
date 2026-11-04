@@ -176,6 +176,43 @@ impl Backend {
     }
 }
 
+/// Check that a configured compiler can actually be started, and describe the
+/// problem when it cannot. A path with a separator is used as given; a bare name
+/// is looked up on `PATH`, matching what `Command::new` does at spawn time.
+fn resolve_compiler(executable: &str) -> std::result::Result<(), String> {
+    let path = Path::new(executable);
+    let resolved = if path.components().count() > 1 {
+        path.to_path_buf()
+    } else {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(executable))
+            .find(|candidate| is_executable(candidate))
+            .ok_or_else(|| format!("jikPath was not found on PATH: {executable}"))?
+    };
+    if !resolved.exists() {
+        return Err(format!("jikPath does not exist: {}", resolved.display()));
+    }
+    if !is_executable(&resolved) {
+        return Err(format!(
+            "jikPath is not an executable file: {}",
+            resolved.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -198,7 +235,16 @@ impl LanguageServer for Backend {
                     }),
             }
         };
-        state.executable = Some(get_string("jikPath")?.unwrap_or_else(|| "jik".into()));
+        // An explicitly configured compiler is validated once here, so a wrong
+        // path fails at startup instead of after every save. The bare default
+        // `jik` is left to the OS loader: it resolves through `PATH` at spawn
+        // time, and refusing to start because the compiler is not installed yet
+        // would break the plain "no configuration" case.
+        let executable = get_string("jikPath")?;
+        if let Some(executable) = executable.as_deref() {
+            resolve_compiler(executable).map_err(Error::invalid_params)?;
+        }
+        state.executable = Some(executable.unwrap_or_else(|| "jik".into()));
         state.entry = get_string("entryPath")?.map(PathBuf::from);
         state.watch_files = params
             .capabilities
@@ -207,8 +253,16 @@ impl LanguageServer for Backend {
             .and_then(|workspace| workspace.did_change_watched_files.as_ref())
             .and_then(|capability| capability.dynamic_registration)
             .unwrap_or(false);
-        if state.entry.as_ref().is_some_and(|p| !p.is_absolute()) {
-            return Err(Error::invalid_params("entryPath must be absolute"));
+        if let Some(entry) = state.entry.as_deref() {
+            if !entry.is_absolute() {
+                return Err(Error::invalid_params("entryPath must be absolute"));
+            }
+            if !entry.is_file() {
+                return Err(Error::invalid_params(format!(
+                    "entryPath does not exist: {}",
+                    entry.display()
+                )));
+            }
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
