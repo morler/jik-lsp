@@ -1,11 +1,11 @@
 ---
 # jik-lsp-qllk
 title: 建立 GitHub Actions CI 门禁
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-11-04T03:21:31Z
-updated_at: 2026-11-04T03:21:31Z
+updated_at: 2026-11-04T03:24:48Z
 parent: jik-lsp-u8g2
 ---
 

@@ -26,3 +26,5 @@ cargo build --release
 上述限制中，只有编译器暴露其读取的依赖及其版本后，未打开依赖的校验才能可靠解决；最终复查与发布之间的竞态需要隔离的不可变输入快照。这两项都需要编译器侧协作，不在本服务器范围内。
 
 目前尚不提供补全、跳转或语义索引。使用 `cargo test` 运行测试；真实编译器测试在 `../jik/jik` 存在时运行，否则跳过。
+
+GitHub Actions 在 `.github/workflows/ci.yml` 中执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 Linux/macOS/Windows 三平台的 `cargo test`；push 到 `main` 与所有 PR 都会触发。CI 环境没有 `../jik/jik`，因此只运行假编译器用例。
