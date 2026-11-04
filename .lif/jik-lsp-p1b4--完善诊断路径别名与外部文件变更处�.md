@@ -1,11 +1,12 @@
 ---
 # jik-lsp-p1b4
 title: 完善诊断路径别名与外部文件变更处理
-status: in-progress
+status: completed
 type: task
-priority: deferred
+priority: normal
 created_at: 2026-11-02T08:52:47Z
-updated_at: 2026-11-04T02:03:36Z
+updated_at: 2026-11-04T02:55:56Z
+commit: c4f90cec91abe3cae40a2b55cdeae0362eefcda9
 ---
 
 原型已记录限制：符号链接等路径别名可能绕过打开文档匹配；检查前后快照无法检测期间改动后恢复、未打开文件变动或检查后到发布前的磁盘修改。设计可靠的文件身份和快照策略，并添加回归测试。
@@ -20,3 +21,7 @@ ocr 评审（会话 1bde634e）指出：把 read_open 复查移入状态锁无�
 
 
 锁内 I/O 收尾（90b070e）：`start_check` 已拆成 `State::reserve_check`（锁内 bump generation、abort 旧任务、返回 `CheckTicket`）与 `Backend::begin_check`（回锁校验 stopped/epoch/generation 后才插入 `checking` 并 spawn `CheckJob`）。`did_save` 与 `did_change_watched_files` 均改为 reserve → publish → 释放锁 → `spawn_blocking` 读入口快照 → 回锁 begin_check，状态锁内不再有文件 I/O。reserve 刻意保留 `checking` 里的旧快照，避免窗口内 watcher 事件被当作新变更而重复检查。watcher 回声判定额外要求 `checking` 已含该入口，无在飞检查时跳过阻塞读；`CheckJob::snapshot` 改 `Arc<HashMap<Url, String>>`，批量事件只复制一次打开文档。新增 1000ms 静默期加固 `echo_of_own_save_does_not_start_second_check`（禁用回声抑制后该测试会失败）。fmt/clippy 全绿，25 项测试全绿。
+
+## Summary of Changes
+
+锁内 I/O 全部移出状态锁（reserve_check/begin_check 拆分），回声判定注释修正，回声回归测试改有界轮询；剩余限制需编译器协作，已在 README 归因
