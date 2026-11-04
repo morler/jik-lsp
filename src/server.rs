@@ -270,8 +270,10 @@ impl LanguageServer for Backend {
                     .iter()
                     .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()))
             });
-            // Nothing to compare with, so skip the read entirely: the usual event
-            // arrives while no check for this entry is in flight.
+            // `checking` keeps the snapshot of the newest check even after it
+            // finishes, so that an echo arriving later is still recognised. It is
+            // only empty for an entry that was never checked, and only then can the
+            // read below be skipped.
             entry.filter(|entry| state.checking.contains_key(entry))
         };
         if let Some(entry) = only_entry {
