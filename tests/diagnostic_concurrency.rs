@@ -201,6 +201,54 @@ exit 1
 }
 
 #[test]
+fn unlocatable_diagnostic_falls_back_to_the_start_of_the_file() {
+    // Both locations are real messages about entry.jik but cannot be mapped into
+    // its text: line 9 does not exist and column 99 is past the end of line 1.
+    // They must still reach the client, losing only the position.
+    let mut h = Harness::new(
+        "printf 'jik error: past the end\n --> %s/entry.jik:9:1\njik error: past the column\n --> %s/entry.jik:1:99\n' \"${0%/*}\" \"${0%/*}\" >&2; exit 1",
+    );
+    let uri = h.open("entry.jik");
+    h.save(&uri);
+    // The warnings arrive before the publication, so they are asserted first:
+    // `wait` discards every message it skips over.
+    for message in ["past the end", "past the column"] {
+        h.wait(|m| {
+            m["method"] == "window/logMessage"
+                && m["params"]["message"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("Cannot locate") && s.contains(message))
+        });
+    }
+    let published = h.diagnostics(&uri, 2);
+    let diagnostics = published["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(
+        diagnostics[0]["range"],
+        json!({"start":{"line":0,"character":0},"end":{"line":0,"character":0}})
+    );
+    let messages: Vec<&str> = diagnostics
+        .iter()
+        .map(|d| d["message"].as_str().unwrap())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("past the end") && m.contains("position not located")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("past the column") && m.contains("position not located")),
+        "{messages:?}"
+    );
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic["source"], "jik");
+        assert_eq!(diagnostic["severity"], 1);
+    }
+}
+
+#[test]
 fn unsaved_open_buffer_skips_check() {
     let mut h = Harness::new(": > \"${0%/*}/started\"");
     let uri = h.open("entry.jik");

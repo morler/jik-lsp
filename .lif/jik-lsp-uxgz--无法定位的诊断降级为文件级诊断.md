@@ -1,11 +1,11 @@
 ---
 # jik-lsp-uxgz
 title: 无法定位的诊断降级为文件级诊断
-status: todo
+status: in-progress
 type: bug
 priority: normal
 created_at: 2026-11-04T03:21:31Z
-updated_at: 2026-11-04T03:21:31Z
+updated_at: 2026-11-04T07:36:03Z
 parent: jik-lsp-rzv8
 ---
 

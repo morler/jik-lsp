@@ -630,25 +630,41 @@ async fn convert_diagnostics(
             };
             text
         };
-        let Some(position) = compiler_position(&text, diagnostic.line, diagnostic.byte_column)
-        else {
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("Cannot locate {}: {}", path.display(), diagnostic.message),
-                )
-                .await;
-            continue;
-        };
+        // A message the compiler located but whose column cannot be mapped into
+        // this text (a lone CR, a column inside a multi-byte character, a stale
+        // line number) still describes a real problem in this file. Report it at
+        // the start of the file instead of dropping it; only the position is lost,
+        // not the error.
+        let (range, message) =
+            match compiler_position(&text, diagnostic.line, diagnostic.byte_column) {
+                Some(position) => (Range::new(position, position), diagnostic.message.clone()),
+                None => {
+                    client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Cannot locate {}: {}", path.display(), diagnostic.message),
+                        )
+                        .await;
+                    (
+                        Range::default(),
+                        format!(
+                            "{} (position not located: compiler reported line {}, byte column {})",
+                            diagnostic.message,
+                            diagnostic.line + 1,
+                            diagnostic.byte_column + 1
+                        ),
+                    )
+                }
+            };
         let diagnostic = Diagnostic {
-            range: Range::new(position, position),
+            range,
             severity: Some(if diagnostic.warning {
                 DiagnosticSeverity::WARNING
             } else {
                 DiagnosticSeverity::ERROR
             }),
             source: Some("jik".into()),
-            message: diagnostic.message,
+            message,
             ..Default::default()
         };
         if matching_open.is_empty() {
