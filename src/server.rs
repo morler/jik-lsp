@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -19,6 +19,14 @@ use tower_lsp::lsp_types::{
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
 };
 use tower_lsp::{Client, LanguageServer};
+
+/// What a reserved check needs from the state it was reserved in, captured under
+/// the state lock so the job can start once the entry is read outside it.
+struct CheckTicket {
+    epoch: u64,
+    generation: u64,
+    executable: String,
+}
 
 #[derive(Default)]
 struct State {
@@ -53,6 +61,29 @@ impl State {
         }
         self.results.insert(entry, result);
         true
+    }
+
+    /// Supersede any in-flight check for `entry`: bump its generation and abort the
+    /// running task. Callers own the state lock and are responsible for clearing
+    /// this entry's old result and publishing once. Superseding before the entry is
+    /// read keeps a finishing check from publishing a result the new check is about
+    /// to replace. The echo snapshot is deliberately kept: emptying it here would
+    /// leave a window in which a watcher event looks like a fresh change and starts
+    /// a duplicate check, and `begin_check` overwrites it once the new read lands.
+    fn reserve_check(&mut self, entry: &Path) -> Option<CheckTicket> {
+        if self.stopped {
+            return None;
+        }
+        let generation = self.generations.entry(entry.to_path_buf()).or_default();
+        *generation = generation.wrapping_add(1);
+        if let Some(task) = self.tasks.remove(entry) {
+            task.abort();
+        }
+        Some(CheckTicket {
+            epoch: self.epoch,
+            generation: *generation,
+            executable: self.executable.clone().unwrap_or_else(|| "jik".into()),
+        })
     }
 }
 
@@ -109,40 +140,39 @@ impl Backend {
         Self::publish(&self.client, state).await;
     }
 
-    /// Supersede any in-flight check for `entry` with a new one. Callers own the
-    /// state lock and are responsible for clearing this entry's old result and
-    /// publishing once; this only bumps the generation and spawns the job.
-    async fn start_check(&self, state: &mut State, entry: PathBuf) {
-        let generation = state.generations.entry(entry.clone()).or_default();
-        *generation = generation.wrapping_add(1);
-        let generation = *generation;
-        // Read off the runtime thread: this snapshot decides whether a later
-        // watcher event is merely the client echoing this save.
-        let start_path = entry.clone();
-        let start = tokio::task::spawn_blocking(move || read_file_snapshot(&start_path))
-            .await
-            .unwrap_or(None);
-        state.checking.insert(entry.clone(), start);
-        let epoch = state.epoch;
-        let executable = state.executable.clone().unwrap_or_else(|| "jik".into());
-        let snapshot = state.documents.texts();
-        let shared = self.state.clone();
-        let client = self.client.clone();
-        let task_entry = entry.clone();
-        if let Some(task) = state.tasks.remove(&task_entry) {
-            task.abort();
+    /// Spawn the job of a reserved check once its entry snapshot has been read
+    /// outside the lock. Returns false when the reservation was invalidated while
+    /// that read was in flight.
+    fn begin_check(
+        &self,
+        state: &mut State,
+        entry: PathBuf,
+        ticket: CheckTicket,
+        snapshot: Arc<HashMap<Url, String>>,
+        start: Option<FileSnapshot>,
+    ) -> bool {
+        if state.stopped
+            || state.epoch != ticket.epoch
+            || state.generations.get(&entry) != Some(&ticket.generation)
+        {
+            return false;
         }
+        // Recorded for later watcher events; read by the caller so no file I/O
+        // runs while this lock is held.
+        state.checking.insert(entry.clone(), start);
+        let task_entry = entry.clone();
         let job = CheckJob {
-            client,
-            shared,
-            executable,
+            client: self.client.clone(),
+            shared: self.state.clone(),
+            executable: ticket.executable,
             entry,
-            epoch,
-            generation,
+            epoch: ticket.epoch,
+            generation: ticket.generation,
             snapshot,
         };
         let task = tokio::spawn(job.run());
         state.tasks.insert(task_entry, task.abort_handle());
+        true
     }
 }
 
@@ -222,10 +252,6 @@ impl LanguageServer for Backend {
         if params.changes.is_empty() {
             return;
         }
-        let mut state = self.state.lock().await;
-        if state.stopped {
-            return;
-        }
         // A client may echo our own save back as a watched-file event. When every
         // reported file is the configured entry and it still holds the content the
         // running check is reading, that check covers this event and a second
@@ -233,30 +259,55 @@ impl LanguageServer for Backend {
         // timestamps, whose granularity is not reliable enough to order a save and
         // the echo it produces. Deleted or missing files, dependencies and
         // unconfigured entrysets always re-check.
-        if let Some(entry) = state.entry.clone() {
-            let only_entry = params
-                .changes
-                .iter()
-                .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()));
-            let echo = only_entry
-                && state
+        let only_entry = {
+            let state = self.state.lock().await;
+            if state.stopped {
+                return;
+            }
+            let entry = state.entry.clone().filter(|entry| {
+                params
+                    .changes
+                    .iter()
+                    .all(|change| change.uri.to_file_path().as_deref() == Ok(entry.as_path()))
+            });
+            // Nothing to compare with, so skip the read entirely: the usual event
+            // arrives while no check for this entry is in flight.
+            entry.filter(|entry| state.checking.contains_key(entry))
+        };
+        if let Some(entry) = only_entry {
+            // Read outside the state lock: deciding whether this is an echo must not
+            // stall every other request behind file I/O.
+            let path = entry.clone();
+            let current = tokio::task::spawn_blocking(move || read_file_snapshot(&path))
+                .await
+                .unwrap_or(None);
+            // Compare against the snapshot of the newest started check, taken after
+            // the read, so a check that began meanwhile still covers this event.
+            let state = self.state.lock().await;
+            if state.stopped {
+                return;
+            }
+            let echo = current.is_some_and(|current| {
+                state
                     .checking
                     .get(&entry)
                     .and_then(Option::as_ref)
-                    .is_some_and(|start| {
-                        read_file_snapshot(&entry)
-                            .is_some_and(|current| current.same_contents(start))
-                    });
+                    .is_some_and(|start| current.same_contents(start))
+            });
             if echo {
                 return;
             }
         }
+        let mut state = self.state.lock().await;
+        if state.stopped {
+            return;
+        }
         // Forget entries whose document is gone instead of keeping them forever.
-        let open = state.documents.paths();
+        let open_documents = state.documents.paths();
         let configured = state.entry.clone();
-        state
-            .generations
-            .retain(|entry, _| configured.as_ref() == Some(entry) || open.contains(entry));
+        state.generations.retain(|entry, _| {
+            configured.as_ref() == Some(entry) || open_documents.contains(entry)
+        });
         let entries: Vec<_> = match configured {
             Some(entry) => vec![entry],
             None => state.generations.keys().cloned().collect(),
@@ -264,12 +315,29 @@ impl LanguageServer for Backend {
         if entries.is_empty() {
             return;
         }
+        // Supersede the running checks before publishing, so a check that is still
+        // finishing cannot republish the results cleared here.
+        let mut tickets = Vec::new();
         for entry in &entries {
             state.results.remove(entry);
+            if let Some(ticket) = state.reserve_check(entry) {
+                tickets.push((entry.clone(), ticket));
+            }
         }
+        // One snapshot per batch: every ticket of this event sees the same buffers.
+        let texts = Arc::new(state.documents.texts());
         Self::publish(&self.client, &mut state).await;
-        for entry in entries {
-            self.start_check(&mut state, entry).await;
+        drop(state);
+        // Take each entry snapshot for the echo check outside the state lock.
+        for (entry, ticket) in tickets {
+            let path = entry.clone();
+            let start = tokio::task::spawn_blocking(move || read_file_snapshot(&path))
+                .await
+                .unwrap_or(None);
+            let mut state = self.state.lock().await;
+            // A false result means the reservation was invalidated while the entry
+            // was read; the superseding event owns the follow-up check.
+            self.begin_check(&mut state, entry, ticket, texts.clone(), start);
         }
     }
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -327,8 +395,24 @@ impl LanguageServer for Backend {
             }
         };
         state.results.remove(&entry);
+        // Reserve before publishing: superseding the previous generation here keeps
+        // a finishing check from republishing the result cleared above.
+        let ticket = state.reserve_check(&entry);
+        let texts = Arc::new(state.documents.texts());
         Self::publish(&self.client, &mut state).await;
-        self.start_check(&mut state, entry).await;
+        // Snapshot the saved file outside the state lock; it decides whether a later
+        // watcher event is merely the client echoing this save.
+        drop(state);
+        if let Some(ticket) = ticket {
+            let path = entry.clone();
+            let start = tokio::task::spawn_blocking(move || read_file_snapshot(&path))
+                .await
+                .unwrap_or(None);
+            let mut state = self.state.lock().await;
+            // A false result means the reservation was invalidated while the entry
+            // was read; whichever event superseded it owns the follow-up check.
+            self.begin_check(&mut state, entry, ticket, texts, start);
+        }
     }
     async fn shutdown(&self) -> Result<()> {
         let mut state = self.state.lock().await;
@@ -351,7 +435,7 @@ struct CheckJob {
     entry: PathBuf,
     epoch: u64,
     generation: u64,
-    snapshot: HashMap<Url, String>,
+    snapshot: Arc<HashMap<Url, String>>,
 }
 
 impl CheckJob {

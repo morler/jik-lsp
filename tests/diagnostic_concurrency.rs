@@ -392,6 +392,9 @@ exit 1
     // The client echoes the save as a watched-file event while the entry still
     // holds the content the finished check read: no second compiler run.
     h.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":uri,"type":2}]}}));
+    // Let a duplicate run write its marker before shutting down, which would
+    // otherwise abort it and hide the duplication.
+    std::thread::sleep(Duration::from_millis(1000));
     h.send(json!({"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}));
     h.wait(|m| m["id"] == 9);
     let runs = fs::read_to_string(h.dir.join("runs")).unwrap_or_default();
