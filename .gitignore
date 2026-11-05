@@ -1,4 +1,5 @@
 /target/
 /dist/
 /.rpi/sessions/
+/.rpi/.resource-lease
 /.supercov/
