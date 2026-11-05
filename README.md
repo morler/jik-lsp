@@ -29,4 +29,6 @@ cargo build --release
 
 GitHub Actions 在 `.github/workflows/ci.yml` 中执行 `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings` 和 Linux/macOS/Windows 三平台的 `cargo test`；push 到 `main` 与所有 PR 都会触发。CI 环境没有 `../jik/jik`，因此只运行假编译器用例。
 
+`.github/workflows/release.yml` 在推送 `v*` tag 时构建 Linux x86_64、macOS arm64、Windows x86_64 三份发布二进制，打包为 `jik-lsp-<tag>-<platform>.tar.gz`（内含可执行文件、README 与 LICENSE）并附到对应 GitHub Release。解包后把其中的 `jik-lsp` 直接用作 `jikPath` 即可。workflow 也可用 `workflow_dispatch` 手动触发；手动触发没有 tag 时不会创建 Release。
+
 真实编译器的行为由契约测试固定下来：诊断列号是 UTF-8 字节列（服务器负责换算为 UTF-16 位置，含中文时字节列与字符列会不同）；解析错误逐条报告，但语义分析在同一模块遇到第一个未定义符号即停止，因此一个保存周期内只可能看到一条语义错误。

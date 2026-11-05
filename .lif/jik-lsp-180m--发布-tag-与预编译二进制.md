@@ -1,11 +1,11 @@
 ---
 # jik-lsp-180m
 title: 发布 tag 与预编译二进制
-status: todo
+status: in-progress
 type: task
 priority: low
 created_at: 2026-11-04T03:21:31Z
-updated_at: 2026-11-04T03:21:31Z
+updated_at: 2026-11-05T01:55:46Z
 parent: jik-lsp-u8g2
 ---
 
